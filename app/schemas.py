@@ -158,6 +158,14 @@ class SessionProductIn(BaseModel):
     price: Decimal = Field(gt=0)
 
 
+class SessionProductOut(BaseModel):
+    id: int
+    product_id: int
+    product_name: str | None = None
+    quantity: int
+    price: Decimal
+
+
 class ProductSaleCreate(BaseModel):
     product_id: int
     quantity: int = Field(gt=0)
@@ -213,6 +221,7 @@ class SessionActiveOut(BaseModel):
     payment_card: Decimal
     payment_debt: Decimal
     debtor_id: int | None = None
+    products: list[SessionProductOut] = []
 
     class Config:
         from_attributes = True

@@ -1,8 +1,11 @@
 import asyncio
+import json
 import os
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
+from urllib import request
+from urllib.error import URLError
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
@@ -23,10 +26,11 @@ from app.models import (
     Income,
     Product,
     ProductSale,
-    Session,
+    Session as SessionModel,
     SessionProduct,
     User,
 )
+from app.timezone import now_uz, today_uz
 from app.schemas import (
     AdminStatisticsOut,
     ComputerOut,
@@ -51,6 +55,8 @@ from app.schemas import (
     SessionActiveOut,
     SessionComplete,
     SessionStart,
+    SessionProductIn,
+    SessionProductOut,
     UploadOut,
     UserCreate,
     UserOut,
@@ -63,7 +69,7 @@ from app.schemas import (
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 except ModuleNotFoundError:
     pass
 
@@ -83,7 +89,7 @@ app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 main_loop = None
 
-def ensure_column_exists(db, table_name: str, column_name: str, column_definition: str):
+def ensure_column_exists(db: Session, table_name: str, column_name: str, column_definition: str):
     inspector = inspect(db.get_bind())
     existing_columns = [col["name"] for col in inspector.get_columns(table_name)]
     if column_name not in existing_columns:
@@ -132,6 +138,50 @@ def money(value):
     return float(value or Decimal("0"))
 
 
+def format_money(value) -> str:
+    return f"{money(value):,.0f}".replace(",", " ") + " so'm"
+
+
+def format_bot_report(title: str, period: str, stats: dict) -> str:
+    return "\n".join(
+        [
+            f"<b>{title}</b>",
+            f"<b>Davr:</b> {period}",
+            "",
+            f"<b>Umumiy summa:</b> {format_money(stats.get('total_revenue'))}",
+            f"<b>Naqd:</b> {format_money(stats.get('total_cash'))}",
+            f"<b>Karta:</b> {format_money(stats.get('total_card'))}",
+            f"<b>Qarz:</b> {format_money(stats.get('total_debt'))}",
+            f"<b>Chegirma:</b> {format_money(stats.get('total_discount'))}",
+            f"<b>Xarajat:</b> {format_money(stats.get('total_expenses', stats.get('total_expense')))}",
+            f"<b>Sof foyda:</b> {format_money(stats.get('net_profit'))}",
+            "",
+            f"<b>Sessiyalar:</b> {stats.get('sessions_count', 0)} ta",
+            f"<b>Sotilgan mahsulotlar:</b> {stats.get('products_sold', 0)} ta",
+            f"<b>Yozuvlar:</b> {stats.get('records_count', 0)} ta",
+            f"<b>Userlar:</b> {stats.get('users_count', 0)} ta",
+        ]
+    )
+
+
+def send_telegram_report(text: str):
+    token = os.getenv("BOT_TOKEN")
+    chat_id = os.getenv("REPORT_CHAT_ID") or os.getenv("ADMIN_CHAT_ID")
+    if not token or not chat_id:
+        return
+    payload = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "HTML"}).encode("utf-8")
+    req = request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        request.urlopen(req, timeout=10).read()
+    except URLError as exc:
+        print(f"Telegram hisobot yuborilmadi: {exc}")
+
+
 active_connections: set[WebSocket] = set()
 
 
@@ -157,14 +207,14 @@ def notify_update(event: str, payload: dict):
 def stats_query(db: Session, start: datetime, end: datetime, user_id: int | None = None):
     income_filters = [Income.created_at >= start, Income.created_at < end]
     expense_filters = [Expense.created_at >= start, Expense.created_at < end]
-    session_filters = [Session.completed_at >= start, Session.completed_at < end, Session.status == "completed"]
+    session_filters = [SessionModel.completed_at >= start, SessionModel.completed_at < end, SessionModel.status == "completed"]
     sale_filters = [ProductSale.created_at >= start, ProductSale.created_at < end]
     if user_id:
         income_filters.append(Income.user_id == user_id)
-        session_filters.append(Session.user_id == user_id)
+        session_filters.append(SessionModel.user_id == user_id)
         sale_filters.append(ProductSale.user_id == user_id)
     total_income = db.query(func.coalesce(func.sum(Income.amount), 0)).filter(*income_filters).scalar() or Decimal("0")
-    total_session_income = db.query(func.coalesce(func.sum(Session.total_amount), 0)).filter(*session_filters).scalar() or Decimal("0")
+    total_session_income = db.query(func.coalesce(func.sum(SessionModel.total_amount), 0)).filter(*session_filters).scalar() or Decimal("0")
     total_sale_income = db.query(func.coalesce(func.sum(ProductSale.total_amount), 0)).filter(*sale_filters).scalar() or Decimal("0")
     total_expense = db.query(func.coalesce(func.sum(Expense.amount), 0)).filter(*expense_filters).scalar() or Decimal("0")
 
@@ -176,9 +226,9 @@ def stats_query(db: Session, start: datetime, end: datetime, user_id: int | None
     for key, value in db.query(Income.payment_type, func.coalesce(func.sum(Income.amount), 0)).filter(*income_filters).group_by(Income.payment_type).all():
         payment_totals[key] += value
     session_payments = db.query(
-        func.coalesce(func.sum(Session.payment_cash), 0),
-        func.coalesce(func.sum(Session.payment_card), 0),
-        func.coalesce(func.sum(Session.payment_debt), 0),
+        func.coalesce(func.sum(SessionModel.payment_cash), 0),
+        func.coalesce(func.sum(SessionModel.payment_card), 0),
+        func.coalesce(func.sum(SessionModel.payment_debt), 0),
     ).filter(*session_filters).one()
     payment_totals["cash"] += session_payments[0]
     payment_totals["card"] += session_payments[1]
@@ -195,38 +245,47 @@ def stats_query(db: Session, start: datetime, end: datetime, user_id: int | None
     category_totals = {}
     for key, value in db.query(Income.category, func.coalesce(func.sum(Income.amount), 0)).filter(*income_filters).group_by(Income.category).all():
         category_totals[key] = category_totals.get(key, Decimal("0")) + value
-    for key, value in db.query(Session.category, func.coalesce(func.sum(Session.computer_amount), 0)).filter(*session_filters).group_by(Session.category).all():
+    for key, value in db.query(SessionModel.category, func.coalesce(func.sum(SessionModel.computer_amount), 0)).filter(*session_filters).group_by(SessionModel.category).all():
         category_totals[key] = category_totals.get(key, Decimal("0")) + value
     products_total = db.query(func.coalesce(func.sum(ProductSale.total_amount), 0)).filter(*sale_filters).scalar() or Decimal("0")
     if products_total:
         category_totals["products"] = category_totals.get("products", Decimal("0")) + products_total
 
+    # Include products sold inside sessions (SessionProduct linked to completed sessions)
+    session_products_qty = db.query(func.coalesce(func.sum(SessionProduct.quantity), 0)).join(SessionModel, SessionModel.id == SessionProduct.session_id).filter(*session_filters).scalar() or 0
+    session_products_amount = db.query(func.coalesce(func.sum(SessionProduct.price * SessionProduct.quantity), 0)).join(SessionModel, SessionModel.id == SessionProduct.session_id).filter(*session_filters).scalar() or Decimal("0")
+    if session_products_amount:
+        category_totals["products"] = category_totals.get("products", Decimal("0")) + session_products_amount
+
     income_count = db.query(func.count(Income.id)).filter(*income_filters).scalar() or 0
-    session_count = db.query(func.count(Session.id)).filter(*session_filters).scalar() or 0
+    session_count = db.query(func.count(SessionModel.id)).filter(*session_filters).scalar() or 0
     sale_count = db.query(func.count(ProductSale.id)).filter(*sale_filters).scalar() or 0
     records_count = income_count + session_count + sale_count
 
-    products_sold = db.query(func.coalesce(func.sum(ProductSale.quantity), 0)).filter(*sale_filters).scalar() or 0
-    total_discount = db.query(func.coalesce(func.sum(Session.discount), 0)).filter(*session_filters).scalar() or Decimal("0")
+    sale_products_qty = db.query(func.coalesce(func.sum(ProductSale.quantity), 0)).filter(*sale_filters).scalar() or 0
+    products_sold = (sale_products_qty or 0) + (session_products_qty or 0)
+    total_discount = db.query(func.coalesce(func.sum(SessionModel.discount), 0)).filter(*session_filters).scalar() or Decimal("0")
 
     user_ids = set()
     user_ids.update([row[0] for row in db.query(func.distinct(Income.user_id)).filter(*income_filters).all()])
-    user_ids.update([row[0] for row in db.query(func.distinct(Session.user_id)).filter(*session_filters).all()])
+    user_ids.update([row[0] for row in db.query(func.distinct(SessionModel.user_id)).filter(*session_filters).all()])
     user_ids.update([row[0] for row in db.query(func.distinct(ProductSale.user_id)).filter(*sale_filters).all()])
     users_count = len(user_ids)
 
     by_user = {}
     for name, value in db.query(User.full_name, func.coalesce(func.sum(Income.amount), 0)).join(Income, Income.user_id == User.id).filter(*income_filters).group_by(User.id).all():
         by_user[name] = by_user.get(name, Decimal("0")) + value
-    for name, value in db.query(User.full_name, func.coalesce(func.sum(Session.total_amount), 0)).join(Session, Session.user_id == User.id).filter(*session_filters).group_by(User.id).all():
+    for name, value in db.query(User.full_name, func.coalesce(func.sum(SessionModel.total_amount), 0)).join(SessionModel, SessionModel.user_id == User.id).filter(*session_filters).group_by(User.id).all():
         by_user[name] = by_user.get(name, Decimal("0")) + value
     for name, value in db.query(User.full_name, func.coalesce(func.sum(ProductSale.total_amount), 0)).join(ProductSale, ProductSale.user_id == User.id).filter(*sale_filters).group_by(User.id).all():
         by_user[name] = by_user.get(name, Decimal("0")) + value
 
+    total_expense_value = money(total_expense)
     return {
         "total_income": money(total_income + total_session_income + total_sale_income),
         "total_revenue": money(total_income + total_session_income + total_sale_income),
-        "total_expense": money(total_expense),
+        "total_expense": total_expense_value,
+        "total_expenses": total_expense_value,
         "net_profit": money(total_income + total_session_income + total_sale_income - total_expense),
         "total_cash": money(payment_totals["cash"]),
         "total_card": money(payment_totals["card"]),
@@ -335,6 +394,19 @@ def delete_user(user_id: int, _: User = Depends(admin_user), db: Session = Depen
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User topilmadi")
+    # Session cleanup handled later; duplicate block removed
+    # Delete dependent rows before removing the user
+    # Sessions and their related SessionProduct and DebtorTransaction
+    session_ids = db.query(SessionModel.id).filter(SessionModel.user_id == user_id).all()
+    session_ids = [sid for (sid,) in session_ids]
+    if session_ids:
+        db.query(SessionProduct).filter(SessionProduct.session_id.in_(session_ids)).delete(synchronize_session=False)
+        db.query(DebtorTransaction).filter(DebtorTransaction.session_id.in_(session_ids)).delete(synchronize_session=False)
+    # Daily reports linked to the user
+    db.query(DailyReport).filter(DailyReport.user_id == user_id).delete(synchronize_session=False)
+    # Daily closings linked to the user
+    db.query(DailyClosing).filter(DailyClosing.user_id == user_id).delete(synchronize_session=False)
+    # Now delete the user (sessions will be cascade-deleted)
     db.delete(user)
     db.commit()
     notify_update('user_deleted', {'user_id': user_id})
@@ -462,9 +534,23 @@ def delete_expense(expense_id: int, _: User = Depends(admin_user), db: Session =
 
 
 @app.get("/api/statistics/daily")
-def daily_statistics(date_filter: date = Query(default_factory=date.today, alias="date"), _: User = Depends(admin_user), db: Session = Depends(get_db)):
-    start, end = day_bounds(date_filter)
-    return {"date": date_filter.isoformat(), **stats_query(db, start, end)}
+def daily_statistics(
+    start_date: date | None = Query(None),
+    end_date: date | None = Query(None),
+    date_filter: date | None = Query(None, alias="date"),
+    _: User = Depends(admin_user),
+    db: Session = Depends(get_db),
+):
+    if start_date and end_date:
+        start, _ = day_bounds(start_date)
+        _, end = day_bounds(end_date)
+    else:
+        # Fallback to single date parameter or today
+        if date_filter:
+            start, end = day_bounds(date_filter)
+        else:
+            start, end = day_bounds(today_uz())
+    return {"date": start.date().isoformat(), **stats_query(db, start, end)}
 
 
 @app.get("/api/statistics/monthly")
@@ -485,21 +571,46 @@ def user_monthly_statistics(user_id: int, month: str = Query(...), user: User = 
 def bot_daily_report(x_bot_api_key: str | None = Header(None), db: Session = Depends(get_db)):
     if x_bot_api_key != os.getenv("BOT_API_KEY", "change-bot-secret"):
         raise HTTPException(status_code=403, detail="Bot API key xato")
-    today = date.today()
+    today = today_uz()
     start, end = day_bounds(today)
     stats = stats_query(db, start, end)
     return {
         "date": today.isoformat(),
+        "title": "Kunlik hisobot",
+        "message": format_bot_report("Kunlik hisobot", today.isoformat(), stats),
         "cashTotal": stats["payment_totals"].get("cash", 0),
         "cardTotal": stats["payment_totals"].get("card", 0),
         "debtTotal": stats["payment_totals"].get("debt", 0),
         "productsTotal": stats["category_totals"].get("products", 0),
+        "discountTotal": stats["total_discount"],
         "recordsCount": stats["records_count"],
         "usersCount": stats["users_count"],
         "totalIncome": stats["total_income"],
         "totalExpense": stats["total_expense"],
         "netProfit": stats["net_profit"],
+        **stats,
     }
+
+
+@app.get("/api/bot/monthly-report")
+def bot_monthly_report(month: str | None = Query(None), x_bot_api_key: str | None = Header(None), db: Session = Depends(get_db)):
+    if x_bot_api_key != os.getenv("BOT_API_KEY", "change-bot-secret"):
+        raise HTTPException(status_code=403, detail="Bot API key xato")
+    selected_month = month or today_uz().strftime("%Y-%m")
+    start, end = month_bounds(selected_month)
+    stats = stats_query(db, start, end)
+    return {"month": selected_month, "title": "Oylik hisobot", "message": format_bot_report("Oylik hisobot", selected_month, stats), **stats}
+
+
+@app.get("/api/bot/yearly-report")
+def bot_yearly_report(year: int | None = Query(None), x_bot_api_key: str | None = Header(None), db: Session = Depends(get_db)):
+    if x_bot_api_key != os.getenv("BOT_API_KEY", "change-bot-secret"):
+        raise HTTPException(status_code=403, detail="Bot API key xato")
+    selected_year = year or today_uz().year
+    start = datetime(selected_year, 1, 1)
+    end = datetime(selected_year + 1, 1, 1)
+    stats = stats_query(db, start, end)
+    return {"year": selected_year, "title": "Yillik hisobot", "message": format_bot_report("Yillik hisobot", str(selected_year), stats), **stats}
 
 
 @app.get("/api/computers", response_model=list[ComputerOut])
@@ -509,14 +620,19 @@ def fetch_computers(user: User = Depends(current_user), db: Session = Depends(ge
 
 @app.get("/api/computers/{computer_id}/active-session", response_model=SessionActiveOut)
 def fetch_active_session(computer_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    session = (
-        db.query(Session)
-        .filter(Session.computer_id == computer_id, Session.status == "active")
-        .order_by(Session.started_at.desc())
-        .first()
-    )
+    session = db.query(SessionModel).filter(SessionModel.computer_id == computer_id, SessionModel.status == "active").order_by(SessionModel.started_at.desc()).first()
     if not session:
         raise HTTPException(status_code=404, detail="Faol sessiya topilmadi")
+    products = [
+        SessionProductOut(
+            id=item.id,
+            product_id=item.product_id,
+            product_name=item.product.name if item.product else None,
+            quantity=item.quantity,
+            price=item.price,
+        )
+        for item in session.products
+    ]
     return SessionActiveOut(
         session_id=session.id,
         computer_id=session.computer_id,
@@ -530,6 +646,7 @@ def fetch_active_session(computer_id: int, user: User = Depends(current_user), d
         payment_card=session.payment_card,
         payment_debt=session.payment_debt,
         debtor_id=session.debtor_id,
+        products=products,
     )
 
 
@@ -543,7 +660,7 @@ def start_session(payload: SessionStart, user: User = Depends(current_user), db:
     products_amount = sum(item.quantity * item.price for item in payload.products)
     total_amount = max(Decimal("0"), payload.computer_price + products_amount - payload.discount)
     category = "playstation" if computer.type == "playstation" else "computer"
-    session = Session(
+    session = SessionModel(
         user_id=user.id,
         computer_id=computer.id,
         computer_price=payload.computer_price,
@@ -561,14 +678,21 @@ def start_session(payload: SessionStart, user: User = Depends(current_user), db:
     db.add(session)
     db.flush()
     for item in payload.products:
+        product = db.get(Product, item.product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Mahsulot {item.product_id} topilmadi")
+        if product.quantity is not None and item.quantity > product.quantity:
+            raise HTTPException(status_code=400, detail=f"Mahsulot {product.name} yetarli emas")
         db.add(
             SessionProduct(
                 session_id=session.id,
-                product_id=item.product_id,
+                product_id=product.id,
                 quantity=item.quantity,
                 price=item.price,
             )
         )
+        if product.quantity is not None:
+            product.quantity = max(0, product.quantity - item.quantity)
     db.commit()
     notify_update('session_started', {'session_id': session.id, 'computer_id': computer.id})
     return {"detail": "Sessiya boshlandi"}
@@ -576,20 +700,56 @@ def start_session(payload: SessionStart, user: User = Depends(current_user), db:
 
 @app.post("/api/sessions/{session_id}/save")
 def save_session(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    session = db.get(Session, session_id)
+    session = db.get(SessionModel, session_id)
     if not session or session.status != "active":
         raise HTTPException(status_code=404, detail="Faol sessiya topilmadi")
     if session.user_id != user.id and user.role != "admin":
         raise HTTPException(status_code=403, detail="Ruxsat yo'q")
-    session.updated_at = datetime.utcnow()
+    session.updated_at = now_uz()
     db.commit()
     notify_update('session_saved', {'session_id': session.id, 'computer_id': session.computer_id})
     return {"detail": "Sessiya saqlandi"}
 
 
+@app.post("/api/sessions/{session_id}/products")
+def add_products_to_session(session_id: int, payload: list[SessionProductIn], user: User = Depends(current_user), db: Session = Depends(get_db)):
+    session = db.get(SessionModel, session_id)
+    if not session or session.status != "active":
+        raise HTTPException(status_code=404, detail="Faol sessiya topilmadi")
+    if session.user_id != user.id and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Ruxsat yo'q")
+    if not payload:
+        raise HTTPException(status_code=400, detail="Hech qanday mahsulot yuborilmadi")
+
+    added_amount = Decimal("0")
+    total_qty = 0
+    for item in payload:
+        product = db.get(Product, item.product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Mahsulot {item.product_id} topilmadi")
+        if product.quantity is not None and item.quantity > product.quantity:
+            raise HTTPException(status_code=400, detail=f"Mahsulot {product.name} yetarli emas")
+        sp = SessionProduct(session_id=session.id, product_id=product.id, quantity=item.quantity, price=item.price)
+        db.add(sp)
+        if product.quantity is not None:
+            product.quantity = max(0, product.quantity - item.quantity)
+        line_amount = item.price * item.quantity
+        added_amount += line_amount
+        total_qty += item.quantity
+
+    # update session totals
+    session.products_amount = (session.products_amount or Decimal("0")) + added_amount
+    session.total_amount = max(Decimal("0"), session.computer_price + session.products_amount - session.discount)
+    session.updated_at = now_uz()
+    db.commit()
+    notify_update('session_product_added', {'session_id': session.id, 'computer_id': session.computer_id, 'added_qty': total_qty})
+    notify_update('product_updated', {'product_id': None})
+    return {"detail": "Mahsulotlar sessiyaga qo'shildi"}
+
+
 @app.post("/api/sessions/{session_id}/complete")
 def complete_session(session_id: int, payload: SessionComplete, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    session = db.get(Session, session_id)
+    session = db.get(SessionModel, session_id)
     if not session or session.status != "active":
         raise HTTPException(status_code=404, detail="Faol sessiya topilmadi")
     if payload.computer_price is not None:
@@ -606,15 +766,15 @@ def complete_session(session_id: int, payload: SessionComplete, user: User = Dep
     session.payment_debt = payload.payment_debt
     session.debtor_id = payload.debtor_id
     session.status = "completed"
-    session.completed_at = datetime.utcnow()
-    session.updated_at = datetime.utcnow()
+    session.completed_at = now_uz()
+    session.updated_at = now_uz()
     session.computer.is_active = False
     if payload.payment_debt > 0 and payload.debtor_id:
         debtor = db.get(Debtor, payload.debtor_id)
         if not debtor:
             raise HTTPException(status_code=404, detail="Qarzdor topilmadi")
         debtor.total_debt += payload.payment_debt
-        debtor.last_payment_at = datetime.utcnow()
+        debtor.last_payment_at = now_uz()
         db.add(
             DebtorTransaction(
                 debtor_id=debtor.id,
@@ -701,6 +861,7 @@ def debtor_history(debtor_id: int, db: Session = Depends(get_db)):
     debtor = db.get(Debtor, debtor_id)
     if not debtor:
         raise HTTPException(status_code=404, detail="Qarzdor topilmadi")
+    # Return transaction history for the debtor
     return db.query(DebtorTransaction).filter(DebtorTransaction.debtor_id == debtor_id).order_by(DebtorTransaction.created_at.desc()).all()
 
 
@@ -792,7 +953,7 @@ def pay_debtor(debtor_id: int, payload: DebtorPayment, user: User = Depends(curr
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Toʻlov summasi 0 dan katta boʻlishi kerak")
     debtor.total_debt = max(Decimal("0"), debtor.total_debt - amount)
-    debtor.last_payment_at = datetime.utcnow()
+    debtor.last_payment_at = now_uz()
     if debtor.total_debt <= 0:
         debtor.is_active = False
     db.add(
@@ -841,7 +1002,7 @@ def product_sale(payload: ProductSaleCreate, user: User = Depends(current_user),
         if not debtor:
             raise HTTPException(status_code=404, detail="Qarzdor topilmadi")
         debtor.total_debt += payload.payment_debt
-        debtor.last_payment_at = datetime.utcnow()
+        debtor.last_payment_at = now_uz()
         db.add(
             DebtorTransaction(
                 debtor_id=debtor.id,
@@ -877,10 +1038,10 @@ def upload_image(image: UploadFile = File(...), user: User = Depends(current_use
 
 @app.post("/api/daily-reports", response_model=DailyReportOut)
 def create_daily_report(payload: DailyReportCreate, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    today = date.today()
-    start, end = day_bounds(today)
+    report_day = today_uz()
+    start, end = day_bounds(report_day)
     stats = stats_query(db, start, end)
-    total_discount = db.query(func.coalesce(func.sum(Session.discount), 0)).filter(Session.completed_at >= start, Session.completed_at < end).scalar() or Decimal("0")
+    total_discount = db.query(func.coalesce(func.sum(SessionModel.discount), 0)).filter(SessionModel.completed_at >= start, SessionModel.completed_at < end).scalar() or Decimal("0")
     report = DailyReport(
         user_id=user.id,
         total_revenue=Decimal(str(stats["total_income"])),
@@ -897,6 +1058,7 @@ def create_daily_report(payload: DailyReportCreate, user: User = Depends(current
     db.commit()
     db.refresh(report)
     notify_update('daily_report_saved', {'report_id': report.id})
+    send_telegram_report(format_bot_report("Kunlik hisobot yakunlandi", report_day.isoformat(), stats))
     return report
 
 
@@ -915,7 +1077,7 @@ def get_daily_report(report_id: int, _: User = Depends(admin_user), db: Session 
 
 @app.get("/api/statistics/user/me")
 def fetch_user_statistics(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    start, end = day_bounds(date.today())
+    start, end = day_bounds(today_uz())
     return stats_query(db, start, end, user_id=user.id)
 
 

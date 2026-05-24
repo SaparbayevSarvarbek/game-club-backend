@@ -6,6 +6,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.timezone import now_uz
 
 
 class UserRole(str, Enum):
@@ -34,8 +35,8 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20), default=UserRole.user.value)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, onupdate=now_uz)
 
     incomes = relationship("Income", back_populates="user", cascade="all, delete-orphan")
     closings = relationship("DailyClosing", back_populates="user", cascade="all, delete-orphan")
@@ -52,8 +53,8 @@ class Income(Base):
     payment_type: Mapped[str] = mapped_column(String(20), index=True)
     category: Mapped[str] = mapped_column(String(30), index=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, onupdate=now_uz)
 
     user = relationship("User", back_populates="incomes")
 
@@ -65,8 +66,8 @@ class Computer(Base):
     number: Mapped[int] = mapped_column(index=True, unique=True)
     type: Mapped[str] = mapped_column(String(30))
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, onupdate=now_uz)
 
     sessions = relationship("Session", back_populates="computer")
 
@@ -79,8 +80,8 @@ class Product(Base):
     price: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     quantity: Mapped[int] = mapped_column(default=0)
     created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, onupdate=now_uz)
 
     created_by = relationship("User")
     sales = relationship("ProductSale", back_populates="product")
@@ -97,8 +98,8 @@ class Debtor(Base):
     total_debt: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
     last_payment_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, onupdate=now_uz)
 
     transactions = relationship("DebtorTransaction", back_populates="debtor")
 
@@ -124,26 +125,39 @@ class Session(Base):
     payment_debt: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
     status: Mapped[str] = mapped_column(String(20), default="active", index=True)
     category: Mapped[str] = mapped_column(String(30), index=True)
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, onupdate=now_uz)
 
     user = relationship("User", back_populates="sessions")
     computer = relationship("Computer", back_populates="sessions")
     debtor = relationship("Debtor")
-    products = relationship("SessionProduct", back_populates="session")
+    # When a Session is deleted, delete its SessionProduct rows
+    products = relationship(
+        "SessionProduct",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    debtor_transactions = relationship(
+        "DebtorTransaction",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class SessionProduct(Base):
     __tablename__ = "session_products"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"), index=True)
+    # Ensure deletion of a Session cascades to SessionProduct rows
+    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
     quantity: Mapped[int] = mapped_column(default=1)
     price: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz)
 
     session = relationship("Session", back_populates="products")
     product = relationship("Product", back_populates="session_products")
@@ -161,8 +175,8 @@ class ProductSale(Base):
     payment_card: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
     payment_debt: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
     debtor_id: Mapped[int | None] = mapped_column(ForeignKey("debtors.id"), index=True, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, onupdate=now_uz)
 
     user = relationship("User", back_populates="product_sales")
     product = relationship("Product", back_populates="sales")
@@ -174,14 +188,15 @@ class DebtorTransaction(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     debtor_id: Mapped[int] = mapped_column(ForeignKey("debtors.id"), index=True)
-    session_id: Mapped[int | None] = mapped_column(ForeignKey("sessions.id"), index=True, nullable=True)
+    session_id: Mapped[int | None] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True, nullable=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
     payment_cash: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
     payment_card: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     debtor = relationship("Debtor", back_populates="transactions")
+    session = relationship("Session", back_populates="debtor_transactions")
 
 
 class DailyReport(Base):
@@ -198,8 +213,8 @@ class DailyReport(Base):
     cash_difference: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
     image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_uz, onupdate=now_uz)
 
     user = relationship("User")
 class DailyClosing(Base):
@@ -222,7 +237,7 @@ class DailyClosing(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow
+        default=now_uz
     )
 
     user = relationship("User", back_populates="closings")
@@ -249,7 +264,7 @@ class Expense(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow
+        default=now_uz
     )
 
     admin = relationship("User")
