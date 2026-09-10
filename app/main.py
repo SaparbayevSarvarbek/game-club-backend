@@ -1508,7 +1508,7 @@ def bot_list_debtors(
     x_bot_api_key: str = Header(..., alias="x-bot-api-key"),
     db: Session = Depends(get_db),
 ):
-    if x_bot_api_key != BOT_API_KEY:
+    if x_bot_api_key != (BOT_API_KEY or "change-bot-secret"):
         raise HTTPException(status_code=403, detail="Bot API key noto'g'ri")
     debtors = db.query(Debtor).filter(Debtor.is_active == True).order_by(Debtor.created_at.desc()).limit(500).all()
     return {
