@@ -1498,3 +1498,32 @@ def yearly_statistics(year: int = Query(...), _: User = Depends(admin_user), db:
     start = datetime(year, 1, 1)
     end = datetime(year + 1, 1, 1)
     return {"year": year, **stats_query(db, start, end)}
+
+
+# ---------------------------------------------------------------------------
+# Bot — qarzdorlar ro'yxati
+# ---------------------------------------------------------------------------
+@app.get("/api/bot/debtors")
+def bot_list_debtors(
+    x_bot_api_key: str = Header(..., alias="x-bot-api-key"),
+    db: Session = Depends(get_db),
+):
+    if x_bot_api_key != BOT_API_KEY:
+        raise HTTPException(status_code=403, detail="Bot API key noto'g'ri")
+    debtors = db.query(Debtor).filter(Debtor.is_active == True).order_by(Debtor.created_at.desc()).limit(500).all()
+    return {
+        "count": len(debtors),
+        "debtors": [
+            {
+                "id": d.id,
+                "first_name": d.first_name,
+                "last_name": d.last_name,
+                "full_name": d.full_name,
+                "phone": d.phone,
+                "total_debt": float(d.total_debt),
+                "note": d.note,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+            }
+            for d in debtors
+        ],
+    }
