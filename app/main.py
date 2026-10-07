@@ -183,6 +183,23 @@ def month_bounds(month: str):
     return start, end
 
 
+def year_bounds(year: int):
+    """
+    Yillik oraliqni klub grafigi bo'yicha hisoblaydi (04:00 - 04:00).
+
+    Masalan, 2026 yil uchun:
+    - start: 2026-01-01 04:00:00
+    - end:   2027-01-01 03:59:59
+
+    Bu daily range (01.01.2026 → 31.12.2026) bilan bir xil natija beradi.
+    """
+    # Yilning birinchi kuni 04:00 da boshlanadi
+    start = datetime(year, 1, 1, 4, 0, 0)
+    # Keyingi yilning birinchi kuni 03:59:59 da tugaydi
+    end = datetime(year + 1, 1, 1, 3, 59, 59, 999999)
+    return start, end
+
+
 def money(value):
     return float(value or Decimal("0"))
 
@@ -789,8 +806,7 @@ def bot_yearly_report(year: int | None = Query(None), x_bot_api_key: str | None 
     if x_bot_api_key != (BOT_API_KEY or "change-bot-secret"):
         raise HTTPException(status_code=403, detail="Bot API key xato")
     selected_year = year or today_uz().year
-    start = datetime(selected_year, 1, 1)
-    end = datetime(selected_year + 1, 1, 1)
+    start, end = year_bounds(selected_year)
     stats = stats_query(db, start, end)
     return {"year": selected_year, "title": "Yillik hisobot", "message": format_bot_report("Yillik hisobot", str(selected_year), stats), **stats}
 
@@ -1372,8 +1388,7 @@ def list_product_sales(
         except ValueError:
             raise HTTPException(status_code=400, detail="Month must be YYYY-MM")
     elif year:
-        start = datetime(year, 1, 1)
-        end = datetime(year + 1, 1, 1)
+        start, end = year_bounds(year)
 
     rows: list[dict] = []
     sale_query = db.query(ProductSale).options(joinedload(ProductSale.product), joinedload(ProductSale.user))
@@ -1483,8 +1498,7 @@ def list_debt_transactions(
         except ValueError:
             raise HTTPException(status_code=400, detail="Month must be YYYY-MM")
     elif year:
-        start = datetime(year, 1, 1)
-        end = datetime(year + 1, 1, 1)
+        start, end = year_bounds(year)
 
     if start and end:
         query = query.filter(DebtorTransaction.created_at >= start, DebtorTransaction.created_at < end)
