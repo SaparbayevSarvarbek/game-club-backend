@@ -164,9 +164,22 @@ def day_bounds(day: date):
 
 
 def month_bounds(month: str):
+    """
+    Oylik oraliqni klub grafigi bo'yicha hisoblaydi (04:00 - 04:00).
+
+    Masalan, 2026-09 oy uchun:
+    - start: 2026-09-01 04:00:00
+    - end:   2026-10-01 03:59:59
+
+    Bu daily range (01.09 → 30.09) bilan bir xil natija beradi.
+    """
     year, mon = [int(part) for part in month.split("-")]
-    start = datetime(year, mon, 1)
-    end = datetime(year + (mon == 12), 1 if mon == 12 else mon + 1, 1)
+    # Oyning birinchi kuni 04:00 da boshlanadi
+    start = datetime(year, mon, 1, 4, 0, 0)
+    # Keyingi oyning birinchi kuni 03:59:59 da tugaydi
+    next_month = mon + 1 if mon < 12 else 1
+    next_year = year if mon < 12 else year + 1
+    end = datetime(next_year, next_month, 1, 3, 59, 59, 999999)
     return start, end
 
 
