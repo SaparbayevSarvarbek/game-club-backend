@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, inspect, or_, text
+from sqlalchemy import and_, func, inspect, or_, text
 from sqlalchemy.orm import Session, joinedload
 
 try:
@@ -263,7 +263,26 @@ def notify_update(event: str, payload: dict):
 def stats_query(db: Session, start: datetime, end: datetime, user_id: int | None = None):
     income_filters = [Income.created_at >= start, Income.created_at < end]
     expense_filters = [Expense.created_at >= start, Expense.created_at < end]
-    session_filters = [SessionModel.completed_at >= start, SessionModel.completed_at < end, SessionModel.status == "completed"]
+
+    # ✅ FIX: completed_at o'rniga created_at ishlatamiz + completed_at NULL bo'lmagan holatlarni ham hisobga olamiz
+    # Completed sessions: completed_at mavjud va davrda
+    # Active/old sessions: created_at davrda va status='completed' (eski ma'lumotlar uchun)
+    session_filters = [
+        SessionModel.status == "completed",
+        or_(
+            and_(
+                SessionModel.completed_at.isnot(None),
+                SessionModel.completed_at >= start,
+                SessionModel.completed_at < end
+            ),
+            and_(
+                SessionModel.completed_at.is_(None),
+                SessionModel.created_at >= start,
+                SessionModel.created_at < end
+            )
+        )
+    ]
+
     sale_filters = [ProductSale.created_at >= start, ProductSale.created_at < end]
     if user_id:
         income_filters.append(Income.user_id == user_id)
@@ -681,17 +700,47 @@ def user_monthly_statistics(user_id: int, month: str = Query(...), user: User = 
     return {"month": month, "user_id": user_id, **stats_query(db, start, end, user_id=user_id)}
 
 
+def parse_flexible_date(date_str: str | None) -> date | None:
+    if not date_str:
+        return None
+    cleaned = date_str.strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y.%m.%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_flexible_month(month_str: str | None) -> str | None:
+    if not month_str:
+        return None
+    cleaned = month_str.strip()
+    for fmt in ("%Y-%m", "%m.%Y", "%m/%Y", "%m-%Y", "%Y.%m", "%Y/%m"):
+        try:
+            return datetime.strptime(cleaned, fmt).strftime("%Y-%m")
+        except ValueError:
+            continue
+    return None
+
+
 @app.get("/api/bot/daily-report")
-def bot_daily_report(x_bot_api_key: str | None = Header(None), db: Session = Depends(get_db)):
+def bot_daily_report(date: str | None = Query(None), x_bot_api_key: str | None = Header(None), db: Session = Depends(get_db)):
     if x_bot_api_key != (BOT_API_KEY or "change-bot-secret"):
         raise HTTPException(status_code=403, detail="Bot API key xato")
-    today = today_uz()
-    start, end = day_bounds(today)
+    if date:
+        parsed_date = parse_flexible_date(date)
+        if not parsed_date:
+            raise HTTPException(status_code=400, detail="Sana formati noto'g'ri. Namuna: 06.10.2026 yoki 2026-10-06")
+        selected_day = parsed_date
+    else:
+        selected_day = today_uz()
+    start, end = day_bounds(selected_day)
     stats = stats_query(db, start, end)
     return {
-        "date": today.isoformat(),
+        "date": selected_day.isoformat(),
         "title": "Kunlik hisobot",
-        "message": format_bot_report("Kunlik hisobot", today.isoformat(), stats),
+        "message": format_bot_report("Kunlik hisobot", selected_day.isoformat(), stats),
         "cashTotal": stats["payment_totals"].get("cash", 0),
         "cardTotal": stats["payment_totals"].get("card", 0),
         "debtTotal": stats["payment_totals"].get("debt", 0),
@@ -710,7 +759,13 @@ def bot_daily_report(x_bot_api_key: str | None = Header(None), db: Session = Dep
 def bot_monthly_report(month: str | None = Query(None), x_bot_api_key: str | None = Header(None), db: Session = Depends(get_db)):
     if x_bot_api_key != (BOT_API_KEY or "change-bot-secret"):
         raise HTTPException(status_code=403, detail="Bot API key xato")
-    selected_month = month or today_uz().strftime("%Y-%m")
+    if month:
+        parsed_month = parse_flexible_month(month)
+        if not parsed_month:
+            raise HTTPException(status_code=400, detail="Oy formati noto'g'ri. Namuna: 10.2026 yoki 2026-10")
+        selected_month = parsed_month
+    else:
+        selected_month = today_uz().strftime("%Y-%m")
     start, end = month_bounds(selected_month)
     stats = stats_query(db, start, end)
     return {"month": selected_month, "title": "Oylik hisobot", "message": format_bot_report("Oylik hisobot", selected_month, stats), **stats}
